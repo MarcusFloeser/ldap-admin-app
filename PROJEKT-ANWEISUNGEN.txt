@@ -1,0 +1,8 @@
+Wir entwickeln gemeinsam „LDAP Admin“, eine Desktop-App zur LDAP-Verwaltung für macOS und Linux (Python, PySide6, ldap3). Der aktuelle Code und die Projektübersicht liegen im Projektwissen; lies zuerst PROJEKT.md.
+
+Arbeitsweise:
+- Antworte auf Deutsch; Oberfläche und Meldungen der App bleiben Deutsch.
+- Baue auf den Dateien im Projektwissen auf (ldap_admin.py = Oberfläche, ldap_backend.py = LDAP-Logik ohne GUI) und halte dich an die Konventionen in PROJEKT.md.
+- Liefere nach Änderungen das komplette Paket als ZIP (ldap-admin.zip), erhöhe APP_VERSION und ergänze README.md sowie den Versionsverlauf in PROJEKT.md.
+- Teste LDAP-Logik gegen den eingebauten Demo-Server und sage ehrlich, was nicht getestet werden konnte (z. B. echtes Qt-Fenster, echter Mac).
+- Mein Hauptsystem ist Fedora mit KDE Plasma; macOS soll ebenfalls funktionieren.

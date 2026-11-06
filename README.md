@@ -54,6 +54,8 @@ ausführen. Entfernen mit `--remove`.
   System-Zertifikaten oder eigener CA-Datei
 - **Passwörter** optional im System-Schlüsselbund (macOS-Schlüsselbund, KWallet,
   GNOME-Schlüsselbund) – nie im Klartext in der Konfigurationsdatei
+- **Verbindungen exportieren und importieren** (z. B. zwischen Linux und Mac), Passwörter
+  optional mit Passphrase verschlüsselt – siehe unten
 - **Mehrere Verbindungen gleichzeitig** in Tabs; **Abmelden** über den Knopf rechts in der
   Werkzeugleiste, Strg/⌘+W oder Menü *Verbindung → Von allen Servern abmelden*
 - **Nur-Lesen-Modus** pro Profil für Produktivsysteme
@@ -75,7 +77,9 @@ ausführen. Entfernen mit `--remove`.
   oder umgekehrt für einen Benutzer alle Gruppenzugehörigkeiten bearbeiten
   (groupOfNames, groupOfUniqueNames, posixGroup, AD-Gruppen)
 - **Benutzerpasswörter gehasht** – siehe unten
-- Suche mit LDAP-Filter, frei wählbaren Spalten und CSV-Export
+- **Suche mit Bedingungen:** Attribut wählen (Vorschläge beim Tippen), Vergleich, Wert –
+  mehrere Bedingungen mit UND/ODER; der LDAP-Filter wird live erzeugt und kann von Hand
+  angepasst werden. Frei wählbare Spalten und CSV-Export
 - **LDIF-Import** (RFC 2849 inkl. changetype add/modify/delete/modrdn) mit Testlauf,
   Konfliktbehandlung, Basis-DN-Ersetzung und Protokoll
 - LDIF-Export eines Teilbaums, Server-Info (Root DSE)
@@ -126,6 +130,38 @@ die zuletzt gewählte Größe.
 Wirkt die ganze Oberfläche unter Linux zu groß, liegt das meist an der Bildschirm-
 skalierung. Sie lässt sich nur für diese App anpassen, z. B. mit
 `QT_SCALE_FACTOR=0.9 ./start.sh`.
+
+## Verbindungen exportieren und importieren
+
+In **Verbindungen verwalten** (oder Menü *Verbindung*) → **Exportieren…** bzw.
+**Importieren…**.
+
+- **Export:** Verbindungen auswählen und als `.json` speichern. Standardmäßig ohne
+  Passwörter. Optional werden im Schlüsselbund gespeicherte Passwörter mitexportiert –
+  dann nur verschlüsselt mit einer Passphrase (mind. 8 Zeichen; PBKDF2-SHA256 mit
+  600 000 Runden, Encrypt-then-MAC). Die Passphrase lässt sich nicht wiederherstellen.
+- **Import:** Die Vorschau zeigt, welche Verbindungen neu und welche bereits vorhanden sind
+  (gleiche ID oder gleicher Server, Port, Bind-DN und Basis-DN). Vorhandene können
+  übersprungen, ersetzt oder zusätzlich als Kopie angelegt werden. Ohne Passphrase werden
+  nur die Verbindungen ohne Passwörter übernommen. Fehlt eine hinterlegte CA-Datei auf dem
+  neuen Rechner, wird das angezeigt.
+- Auch die eigene `connections.json` (siehe *Speicherorte*) lässt sich direkt importieren.
+
+## Suche
+
+**Suchen** (Strg/⌘+F) öffnet die Suche ab dem ausgewählten Eintrag.
+
+- Jede **Bedingung** besteht aus *Attribut*, *Vergleich* und *Wert*. Beim Tippen im
+  Attributfeld werden passende Attribute aus dem Schema des Servers vorgeschlagen (auch
+  Teilwörter, z. B. „phone“ → telephoneNumber). Häufige Attribute stehen oben in der Liste.
+- Vergleiche: enthält, ist gleich, beginnt mit, endet mit, ist vorhanden, enthält nicht,
+  ist nicht, fehlt, ≥, ≤. Im Wert ist `*` ein Platzhalter; Sonderzeichen wie `(`, `)` oder
+  `\` werden automatisch maskiert.
+- Bei `objectClass` werden die Objektklassen des Servers als Werte vorgeschlagen.
+- **+ Bedingung** fügt weitere hinzu – verknüpft mit UND oder ODER.
+- Das Feld **LDAP-Filter** zeigt den erzeugten Filter. Er kann von Hand angepasst werden;
+  ↺ erzeugt ihn wieder aus den Bedingungen.
+- Gesuchte Attribute erscheinen automatisch als zusätzliche Spalte im Ergebnis.
 
 ## Drag & Drop
 

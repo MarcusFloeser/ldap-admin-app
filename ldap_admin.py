@@ -23,7 +23,7 @@ try:
     from PySide6.QtCore import QSettings, QSize, Qt, QTimer
     from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QFont, QKeySequence
     from PySide6.QtWidgets import (
-        QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
+        QAbstractItemView, QApplication, QCheckBox, QComboBox, QCompleter, QDialog,
         QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QInputDialog,
         QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
         QPlainTextEdit, QPushButton, QSizePolicy, QSpinBox, QSplitter, QStackedWidget, QStyle, QTabWidget,
@@ -40,14 +40,14 @@ except ImportError:
     sys.exit("ldap3 fehlt. Bitte mit ./start.sh starten oder: pip install -r requirements.txt")
 
 from ldap_backend import (
-    CHILD_LIMIT, PASSWORD_SCHEMES, LdapError, LdapSession, NonLeafMoveError, Profile,
-    ProfileStore, decode_value,
+    CHILD_LIMIT, FILTER_OPS, FREQUENT_ATTRS, OPS_WITHOUT_VALUE, PASSWORD_SCHEMES, LdapError,
+    LdapSession, NonLeafMoveError, Profile, ProfileStore, build_filter, decode_value,
     demo_session, describe_password, hash_password, is_hashed, local_scheme, norm_dn, parent_of,
-    parse_ldif, rdn_of, split_dn,
+    parse_ldif, rdn_of, read_export, split_dn,
 )
 
 APP_NAME = "LDAP Admin"
-APP_VERSION = "1.10"
+APP_VERSION = "1.12"
 ROLE_DN = Qt.ItemDataRole.UserRole
 ROLE_LOADED = Qt.ItemDataRole.UserRole + 1
 ROLE_RAW = Qt.ItemDataRole.UserRole + 2
@@ -383,6 +383,14 @@ class ConnectionManagerDialog(SizeMemory, QDialog):
         self.btn_del.clicked.connect(self._delete)
         self.btn_up.clicked.connect(lambda *_: self._move(-1))
         self.btn_down.clicked.connect(lambda *_: self._move(1))
+        self.btn_export = QPushButton("Exportieren…")
+        self.btn_import = QPushButton("Importieren…")
+        self.btn_export.setToolTip("Verbindungen in eine Datei sichern, z. B. für einen "
+                                   "anderen Rechner")
+        self.btn_import.setToolTip("Verbindungen aus einer Exportdatei übernehmen")
+        self.btn_export.clicked.connect(
+            lambda *_: export_connections(self, self.store, None))
+        self.btn_import.clicked.connect(self._import)
         side = QVBoxLayout()
         for b in (self.btn_new, self.btn_edit, self.btn_dup, self.btn_del):
             side.addWidget(b)
@@ -390,6 +398,9 @@ class ConnectionManagerDialog(SizeMemory, QDialog):
         arrows.addWidget(self.btn_up)
         arrows.addWidget(self.btn_down)
         side.addLayout(arrows)
+        side.addSpacing(12)
+        side.addWidget(self.btn_export)
+        side.addWidget(self.btn_import)
         side.addStretch()
 
         top = QHBoxLayout()
@@ -432,6 +443,7 @@ class ConnectionManagerDialog(SizeMemory, QDialog):
         for b in (self.btn_edit, self.btn_dup, self.btn_del, self.btn_connect,
                   self.btn_up, self.btn_down):
             b.setEnabled(has)
+        self.btn_export.setEnabled(bool(self.store.profiles))
 
     def _current(self) -> Profile | None:
         row = self.list.currentRow()
@@ -490,6 +502,11 @@ class ConnectionManagerDialog(SizeMemory, QDialog):
         self.store.save()
         self._refresh(row)
 
+    def _import(self, *_):
+        before = len(self.store.profiles)
+        if import_connections(self, self.store):
+            self._refresh(before if len(self.store.profiles) > before else self.list.currentRow())
+
     def _move(self, delta: int):
         row = self.list.currentRow()
         new = row + delta
@@ -505,6 +522,227 @@ class ConnectionManagerDialog(SizeMemory, QDialog):
             return
         self.selected = p
         self.accept()
+
+
+def _checkable(label: str, checked: bool = True, tooltip: str = "") -> QListWidgetItem:
+    item = QListWidgetItem(label)
+    item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+    item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+    if tooltip:
+        item.setToolTip(tooltip)
+    return item
+
+
+def _checked_rows(lw: QListWidget) -> list[int]:
+    return [i for i in range(lw.count()) if lw.item(i).checkState() == Qt.CheckState.Checked]
+
+
+def _all_none_row(lw: QListWidget) -> QHBoxLayout:
+    row = QHBoxLayout()
+    for label, state in (("Alle", Qt.CheckState.Checked), ("Keine", Qt.CheckState.Unchecked)):
+        b = QPushButton(label)
+        b.clicked.connect(lambda *_, st=state: [lw.item(i).setCheckState(st)
+                                                for i in range(lw.count())])
+        row.addWidget(b)
+    row.addStretch()
+    return row
+
+
+class ExportConnectionsDialog(SizeMemory, QDialog):
+    def __init__(self, store: ProfileStore, preselect: Profile | None = None, parent=None):
+        super().__init__(parent)
+        self.store = store
+        self.setWindowTitle("Verbindungen exportieren")
+        self.resize(600, 460)
+        self.list = QListWidget()
+        for p in store.profiles:
+            mark = "  🔑" if store.get_password(p) else ""
+            checked = preselect is None or p.id == preselect.id
+            self.list.addItem(_checkable(f"{p.name}   ({p.url()}){mark}", checked,
+                                         p.bind_dn or "anonym"))
+        self.list.setMinimumWidth(fit_list_width(self.list, 360))
+        with_pw = sum(1 for p in store.profiles if store.get_password(p))
+        self.with_pw = QCheckBox(f"Gespeicherte Passwörter mitexportieren – verschlüsselt "
+                                 f"({with_pw} vorhanden)")
+        self.with_pw.setEnabled(with_pw > 0)
+        self.with_pw.toggled.connect(self._toggle_pw)
+        self.pw1 = QLineEdit()
+        self.pw2 = QLineEdit()
+        for w in (self.pw1, self.pw2):
+            w.setEchoMode(QLineEdit.EchoMode.Password)
+            w.setEnabled(False)
+        self.pw1.setPlaceholderText("mind. 8 Zeichen – wird beim Import benötigt")
+        form = make_form()
+        form.addRow("Passphrase:", self.pw1)
+        form.addRow("Wiederholen:", self.pw2)
+        note = QLabel("Ohne Passwörter enthält die Datei nur Server, Ports und Bind-DNs. "
+                      "Mit Passwörtern werden diese mit der Passphrase verschlüsselt – "
+                      "Passphrase gut merken, sie lässt sich nicht wiederherstellen.")
+        note.setWordWrap(True)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        ok = buttons.addButton("Exportieren…", QDialogButtonBox.ButtonRole.AcceptRole)
+        ok.clicked.connect(self._export)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Zu exportierende Verbindungen:"))
+        layout.addWidget(self.list, 1)
+        layout.addLayout(_all_none_row(self.list))
+        layout.addWidget(self.with_pw)
+        layout.addLayout(form)
+        layout.addWidget(note)
+        layout.addWidget(buttons)
+        self.result_text = ""
+
+    def _toggle_pw(self, on: bool):
+        for w in (self.pw1, self.pw2):
+            w.setEnabled(on)
+        if on:
+            self.pw1.setFocus()
+
+    def _export(self, *_):
+        rows = _checked_rows(self.list)
+        if not rows:
+            QMessageBox.warning(self, APP_NAME, "Bitte mindestens eine Verbindung auswählen.")
+            return
+        passphrase = None
+        if self.with_pw.isChecked():
+            passphrase = self.pw1.text()
+            if len(passphrase) < 8:
+                QMessageBox.warning(self, APP_NAME, "Die Passphrase muss mindestens 8 Zeichen "
+                                                    "lang sein.")
+                return
+            if passphrase != self.pw2.text():
+                QMessageBox.warning(self, APP_NAME, "Die Passphrasen stimmen nicht überein.")
+                return
+        path, _ = QFileDialog.getSaveFileName(self, "Verbindungen exportieren",
+                                              "ldap-verbindungen.json",
+                                              "LDAP-Admin-Verbindungen (*.json)")
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+        profiles = [self.store.profiles[i] for i in rows]
+        res = run_safely(self, "Export", self.store.export_profiles, profiles, path, passphrase)
+        if res is FAIL:
+            return
+        pw = f", davon {res['passwords']} mit verschlüsseltem Passwort" if passphrase else \
+            " (ohne Passwörter)"
+        self.result_text = f"{res['count']} Verbindung(en) exportiert{pw}:\n{path}"
+        self.accept()
+
+
+class ImportConnectionsDialog(SizeMemory, QDialog):
+    ON_EXISTS = [("Überspringen", "skip"), ("Durch importierte ersetzen", "replace"),
+                 ("Zusätzlich als Kopie anlegen", "copy")]
+
+    def __init__(self, store: ProfileStore, data, path: str, parent=None):
+        super().__init__(parent)
+        self.store, self.data = store, data
+        self.setWindowTitle("Verbindungen importieren")
+        self.resize(640, 480)
+        self.list = QListWidget()
+        dupes = 0
+        for p, token in data.connections:
+            existing = store.find_existing(p)
+            dupes += existing is not None
+            status = f"vorhanden als „{existing.name}“" if existing else "neu"
+            extras = []
+            if token:
+                extras.append("🔑")
+            if p.ca_file and not os.path.exists(p.ca_file):
+                extras.append("⚠ CA-Datei fehlt")
+            extra = ("  " + "  ".join(extras)) if extras else ""
+            tip = f"{p.bind_dn or 'anonym'}"
+            if p.ca_file and not os.path.exists(p.ca_file):
+                tip += f"\nCA-Datei nicht gefunden: {p.ca_file} – nach dem Import anpassen."
+            self.list.addItem(_checkable(f"{p.name}   ({p.url()})   – {status}{extra}",
+                                         existing is None, tip))
+        self.list.setMinimumWidth(fit_list_width(self.list, 380))
+        self.on_exists = QComboBox()
+        for label, key in self.ON_EXISTS:
+            self.on_exists.addItem(label, key)
+        self.pw = QLineEdit()
+        self.pw.setEchoMode(QLineEdit.EchoMode.Password)
+        self.pw.setPlaceholderText("leer lassen = ohne Passwörter importieren")
+        self.keyring_note = QLabel("")
+        self.keyring_note.setWordWrap(True)
+        if data.encrypted and not store.keyring_available():
+            self.keyring_note.setText("Kein Schlüsselbund verfügbar – Passwörter können nicht "
+                                      "gespeichert werden und werden beim Verbinden abgefragt.")
+        form = make_form()
+        form.addRow("Datei:", QLabel(os.path.basename(path) +
+                                     (f"  (exportiert {data.exported[:10]})" if data.exported else "")))
+        form.addRow("Bereits vorhanden:", self.on_exists)
+        if data.encrypted:
+            form.addRow("Passphrase:", self.pw)
+        info = QLabel(f"{len(data.connections)} Verbindung(en) in der Datei, davon {dupes} "
+                      "bereits vorhanden (gleiche ID oder gleicher Server, Port, Bind-DN und "
+                      "Basis-DN). Vorhandene sind zunächst abgewählt.")
+        info.setWordWrap(True)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        ok = buttons.addButton("Importieren", QDialogButtonBox.ButtonRole.AcceptRole)
+        ok.clicked.connect(self._import)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(info)
+        layout.addWidget(self.list, 1)
+        layout.addLayout(_all_none_row(self.list))
+        layout.addLayout(form)
+        layout.addWidget(self.keyring_note)
+        layout.addWidget(buttons)
+        self.result_text = ""
+
+    def _import(self, *_):
+        rows = _checked_rows(self.list)
+        if not rows:
+            QMessageBox.warning(self, APP_NAME, "Bitte mindestens eine Verbindung auswählen.")
+            return
+        passphrase = self.pw.text() if self.data.encrypted else ""
+        res = run_safely(self, "Import", self.store.import_profiles, self.data, rows,
+                         self.on_exists.currentData(), passphrase or None)
+        if res is FAIL:
+            self.pw.selectAll()
+            self.pw.setFocus()
+            return
+        parts = [f"{res['added']} hinzugefügt"]
+        if res["replaced"]:
+            parts.append(f"{res['replaced']} ersetzt")
+        if res["skipped"]:
+            parts.append(f"{res['skipped']} übersprungen")
+        text = "Import abgeschlossen: " + ", ".join(parts) + "."
+        if res["passwords"]:
+            text += f"\n{res['passwords']} Passwort/Passwörter im Schlüsselbund gespeichert."
+        if res["passwords_not_stored"]:
+            text += (f"\n{res['passwords_not_stored']} Passwort/Passwörter konnten nicht "
+                     "gespeichert werden (kein Schlüsselbund).")
+        if self.data.encrypted and not passphrase:
+            text += "\nPasswörter wurden nicht importiert (keine Passphrase angegeben)."
+        self.result_text = text
+        self.accept()
+
+
+def export_connections(parent, store: ProfileStore, preselect: Profile | None = None) -> None:
+    if not store.profiles:
+        QMessageBox.information(parent, APP_NAME, "Es sind noch keine Verbindungen gespeichert.")
+        return
+    dlg = ExportConnectionsDialog(store, preselect, parent)
+    if dlg.exec() and dlg.result_text:
+        QMessageBox.information(parent, "Export", dlg.result_text)
+
+
+def import_connections(parent, store: ProfileStore) -> bool:
+    path, _ = QFileDialog.getOpenFileName(parent, "Verbindungen importieren", "",
+                                          "LDAP-Admin-Verbindungen (*.json);;Alle Dateien (*)")
+    if not path:
+        return False
+    data = run_safely(parent, "Import", read_export, path)
+    if data is FAIL:
+        return False
+    dlg = ImportConnectionsDialog(store, data, path, parent)
+    if dlg.exec() and dlg.result_text:
+        QMessageBox.information(parent, "Import", dlg.result_text)
+        return True
+    return False
 
 
 # =========================================================================== #
@@ -1048,6 +1286,82 @@ class ImportDialog(SizeMemory, QDialog):
             self.imported = True
 
 
+class ConditionRow(QWidget):
+    """Eine Suchbedingung: [Attribut (mit Vorschlägen)] [Vergleich] [Wert] [–]"""
+
+    def __init__(self, dialog: "SearchDialog", attr: str = "cn", op: str = "contains",
+                 value: str = ""):
+        super().__init__()
+        self.dialog = dialog
+        self.attr = QComboBox()
+        self.attr.setEditable(True)
+        self.attr.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.attr.setMinimumWidth(200)
+        self.attr.setMaxVisibleItems(20)
+        frequent = [a for a in FREQUENT_ATTRS if a.lower() in dialog.attr_lookup] or FREQUENT_ATTRS
+        self.attr.addItems(frequent)
+        rest = [a for a in dialog.attr_names if a.lower() not in {f.lower() for f in frequent}]
+        if rest:
+            self.attr.insertSeparator(self.attr.count())
+            self.attr.addItems(rest)
+        completer = QCompleter(frequent + rest, self.attr)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        completer.setMaxVisibleItems(15)
+        self.attr.setCompleter(completer)
+        self.attr.setCurrentText(attr)
+        self.attr.setToolTip("Attribut – beim Tippen werden passende Attribute vorgeschlagen")
+
+        self.op = QComboBox()
+        for key, label in FILTER_OPS:
+            self.op.addItem(label, key)
+        self.op.setCurrentIndex([k for k, _ in FILTER_OPS].index(op))
+
+        self.value = QLineEdit(value)
+        self.value.setPlaceholderText("Wert  (* als Platzhalter möglich)")
+        self.value.returnPressed.connect(dialog.search)
+        self.value_completer = None
+
+        self.remove_btn = QPushButton("–")
+        self.remove_btn.setFixedWidth(28)
+        self.remove_btn.setToolTip("Bedingung entfernen")
+        self.remove_btn.clicked.connect(lambda *_: dialog.remove_condition(self))
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.attr, 2)
+        layout.addWidget(self.op)
+        layout.addWidget(self.value, 3)
+        layout.addWidget(self.remove_btn)
+
+        self.attr.currentTextChanged.connect(self._attr_changed)
+        self.op.currentIndexChanged.connect(lambda *_: self._op_changed())
+        self.value.textChanged.connect(lambda *_: dialog.conditions_changed())
+        self._attr_changed(self.attr.currentText())
+        self._op_changed()
+
+    def _attr_changed(self, text: str):
+        # Für objectClass die bekannten Objektklassen als Wertvorschläge anbieten
+        if text.strip().lower() == "objectclass" and self.dialog.object_classes:
+            if self.value_completer is None:
+                self.value_completer = QCompleter(self.dialog.object_classes, self.value)
+                self.value_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+                self.value_completer.setFilterMode(Qt.MatchFlag.MatchContains)
+            self.value.setCompleter(self.value_completer)
+        else:
+            self.value.setCompleter(None)
+        self.dialog.conditions_changed()
+
+    def _op_changed(self):
+        needs_value = self.op.currentData() not in OPS_WITHOUT_VALUE
+        self.value.setEnabled(needs_value)
+        self.dialog.conditions_changed()
+
+    def condition(self) -> tuple[str, str, str]:
+        return self.attr.currentText().strip(), self.op.currentData(), self.value.text()
+
+
 class SearchDialog(SizeMemory, QDialog):
     SCOPES = [("Gesamter Unterbaum", SUBTREE), ("Eine Ebene", LEVEL), ("Nur Basis", BASE)]
 
@@ -1055,10 +1369,51 @@ class SearchDialog(SizeMemory, QDialog):
         super().__init__(session_widget)
         self.sw = session_widget
         self.setWindowTitle(f"Suche – {session_widget.session.profile.name}")
-        self.resize(820, 520)
+        self.resize(900, 600)
+        self.attr_names = session_widget._attr_names or list(FREQUENT_ATTRS)
+        self.attr_lookup = {a.lower(): a for a in self.attr_names}
+        self.object_classes = session_widget.session.object_classes()
+        self.rows: list[ConditionRow] = []
+        self._manual = False
+        self._building = True
+
         self.base = QLineEdit(base)
+
+        # Bedingungen ------------------------------------------------------------
+        self.rows_box = QVBoxLayout()
+        self.rows_box.setSpacing(4)
+        add = QPushButton("+ Bedingung")
+        add.setToolTip("Weitere Bedingung hinzufügen")
+        add.clicked.connect(lambda *_: self.add_condition())
+        self.combine = QComboBox()
+        self.combine.addItem("alle Bedingungen erfüllt (UND)", "and")
+        self.combine.addItem("mindestens eine erfüllt (ODER)", "or")
+        self.combine.currentIndexChanged.connect(lambda *_: self.conditions_changed())
+        cond_tools = QHBoxLayout()
+        cond_tools.addWidget(add)
+        cond_tools.addWidget(self.combine)
+        cond_tools.addStretch()
+        cond_box = QVBoxLayout()
+        cond_box.addLayout(self.rows_box)
+        cond_box.addLayout(cond_tools)
+
+        # Erzeugter Filter (von Hand anpassbar) ---------------------------------
         self.filter = QLineEdit("(objectClass=*)")
-        self.filter.setPlaceholderText("z. B. (&(objectClass=person)(mail=*@firma.ch))")
+        self.filter.setToolTip("Wird aus den Bedingungen erzeugt. Kann von Hand angepasst werden.")
+        self.filter.textEdited.connect(self._filter_edited)
+        self.filter.returnPressed.connect(self.search)
+        self.regen = QPushButton("↺")
+        self.regen.setFixedWidth(32)
+        self.regen.setToolTip("Filter wieder aus den Bedingungen erzeugen")
+        self.regen.clicked.connect(lambda *_: self._reset_manual())
+        self.regen.setVisible(False)
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(self.filter, 1)
+        filter_row.addWidget(self.regen)
+        self.filter_note = QLabel("")
+        self.filter_note.setStyleSheet("color: #8a6d00;")
+        self.filter_note.setVisible(False)
+
         self.scope = QComboBox()
         for label, scope in self.SCOPES:
             self.scope.addItem(label, scope)
@@ -1069,14 +1424,16 @@ class SearchDialog(SizeMemory, QDialog):
         self.limit.setValue(1000)
         go = QPushButton("Suchen")
         go.setDefault(True)
-        go.clicked.connect(self._search)
+        go.clicked.connect(lambda *_: self.search())
         self.export_btn = QPushButton("Als CSV exportieren…")
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self._export)
 
         form = make_form()
         form.addRow("Basis-DN:", self.base)
-        form.addRow("Filter:", self.filter)
+        form.addRow("Bedingungen:", cond_box)
+        form.addRow("LDAP-Filter:", filter_row)
+        form.addRow("", self.filter_note)
         row = QHBoxLayout()
         row.addWidget(self.scope)
         row.addWidget(QLabel("Max. Treffer:"))
@@ -1102,11 +1459,100 @@ class SearchDialog(SizeMemory, QDialog):
         layout.addWidget(self.table, 1)
         layout.addLayout(bottom)
 
-    def _search(self):
+        self._building = False
+        first = self.add_condition()
+        first.value.setFocus()
+
+    # Bedingungen ---------------------------------------------------------------
+    def add_condition(self, attr: str = "cn", op: str = "contains", value: str = "") -> ConditionRow:
+        row = ConditionRow(self, attr, op, value)
+        self.rows.append(row)
+        self.rows_box.addWidget(row)
+        self._update_remove_buttons()
+        self.conditions_changed()
+        if len(self.rows) > 1:
+            row.attr.setFocus()
+            row.attr.lineEdit().selectAll()
+        return row
+
+    def remove_condition(self, row: ConditionRow):
+        if len(self.rows) <= 1:
+            row.value.clear()
+            return
+        self.rows.remove(row)
+        self.rows_box.removeWidget(row)
+        row.deleteLater()
+        self._update_remove_buttons()
+        self.conditions_changed()
+
+    def _update_remove_buttons(self):
+        for r in self.rows:
+            r.remove_btn.setEnabled(len(self.rows) > 1)
+        self.combine.setEnabled(len(self.rows) > 1)
+
+    def conditions(self) -> list[tuple[str, str, str]]:
+        return [r.condition() for r in self.rows]
+
+    def conditions_changed(self):
+        if getattr(self, "_building", True) or self._manual:
+            return
+        try:
+            self.filter.setText(build_filter(self.conditions(), self.combine.currentData()))
+            self.filter.setStyleSheet("")
+        except LdapError:
+            self.filter.setStyleSheet("color: #c0392b;")
+
+    def _filter_edited(self, _text):
+        if not self._manual:
+            self._manual = True
+            self.regen.setVisible(True)
+            self.filter_note.setText("Filter von Hand geändert – Änderungen an den Bedingungen "
+                                     "werden nicht übernommen (↺ setzt zurück).")
+            self.filter_note.setVisible(True)
+
+    def _reset_manual(self):
+        self._manual = False
+        self.regen.setVisible(False)
+        self.filter_note.setVisible(False)
+        self.conditions_changed()
+
+    def _check_conditions(self) -> str | None:
+        """Fehlermeldung für unbekannte Attribute, sonst None."""
+        unknown = []
+        for attr, op, value in self.conditions():
+            if not attr or (op not in OPS_WITHOUT_VALUE and value == ""):
+                continue
+            if self.sw._attr_names and attr.lower() not in self.attr_lookup:
+                unknown.append(attr)
+        if unknown:
+            return ("Diese Attribute kennt der Server nicht: " + ", ".join(unknown) +
+                    "\nBitte ein Attribut aus der Vorschlagsliste wählen.")
+        return None
+
+    # Suche ---------------------------------------------------------------------
+    def search(self):
+        if not self._manual:
+            problem = self._check_conditions()
+            if problem:
+                QMessageBox.warning(self, "Suche", problem)
+                return
+            try:
+                flt = build_filter(self.conditions(), self.combine.currentData())
+            except LdapError as exc:
+                QMessageBox.warning(self, "Suche", str(exc))
+                return
+            self.filter.setText(flt)
+        else:
+            flt = self.filter.text().strip() or "(objectClass=*)"
+            if not flt.startswith("("):
+                flt = f"({flt})"
         cols = [a.strip() for a in self.attrs.text().split(",") if a.strip()]
-        flt = self.filter.text().strip() or "(objectClass=*)"
-        if not flt.startswith("("):
-            flt = f"({flt})"
+        # Gesuchte Attribute zusätzlich als Spalte zeigen
+        for attr, op, value in ([] if self._manual else self.conditions()):
+            if attr and attr.lower() not in {c.lower() for c in cols} \
+                    and attr.lower() != "objectclass" \
+                    and (op in OPS_WITHOUT_VALUE or value != ""):
+                cols.append(self.attr_lookup.get(attr.lower(), attr))
         res = run_safely(self, "Suche", self.sw.session.search, self.base.text().strip(), flt,
                          self.scope.currentData(), cols or ["1.1"], self.limit.value())
         if res is FAIL:
@@ -1122,9 +1568,12 @@ class SearchDialog(SizeMemory, QDialog):
             for col, name in enumerate(cols, 1):
                 vals = []
                 for v in raw.get(name.lower(), []):
+                    if name.lower() == "userpassword":
+                        vals.append(describe_password(v))
+                        continue
                     text = decode_value(name, v) if isinstance(v, bytes) else str(v)
                     vals.append(text if text is not None else f"<binär, {len(v)} Bytes>")
-                self.table.setItem(row, col, QTableWidgetItem("; ".join(vals)))
+                self.table.setItem(row, col, QTableWidgetItem("; ".join(sorted(vals, key=str.lower))))
         self.table.setSortingEnabled(True)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -1134,6 +1583,7 @@ class SearchDialog(SizeMemory, QDialog):
         self.status.setText(f"{len(res)} Treffer{more}")
         self.export_btn.setEnabled(bool(res))
 
+
     def _open(self, row, _col):
         item = self.table.item(row, 0)
         if item:
@@ -1141,7 +1591,7 @@ class SearchDialog(SizeMemory, QDialog):
             self.sw.window().raise_()
             self.sw.window().activateWindow()
 
-    def _export(self):
+    def _export(self, *_):
         path, _ = QFileDialog.getSaveFileName(self, "CSV speichern", "suchergebnis.csv",
                                               "CSV (*.csv)")
         if not path:
@@ -2157,6 +2607,11 @@ class MainWindow(QMainWindow):
         self.recent_menu = m.addMenu("Verbinden mit")
         self.recent_menu.aboutToShow.connect(self._fill_recent_menu)
         m.addAction("Demo-Server öffnen").triggered.connect(self.open_demo)
+        m.addSeparator()
+        m.addAction("Verbindungen exportieren…").triggered.connect(
+            lambda *_: export_connections(self, self.store))
+        m.addAction("Verbindungen importieren…").triggered.connect(
+            lambda *_: import_connections(self, self.store) and self._refresh_quick())
         m.addSeparator()
         a = m.addAction("Abmelden (aktuelle Verbindung)")
         a.setShortcut(QKeySequence("Ctrl+W"))

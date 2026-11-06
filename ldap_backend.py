@@ -9,11 +9,13 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import ssl
 import sys
 import uuid
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -157,6 +159,206 @@ class ProfileStore:
             keyring.delete_password(KEYRING_SERVICE, p.id)
         except Exception:
             pass
+
+    # Export / Import ----------------------------------------------------------
+    def find_existing(self, p: Profile) -> Profile | None:
+        """Gleiche Verbindung bereits vorhanden? Erst über die ID, dann über Server+Bind-DN."""
+        for q in self.profiles:
+            if q.id == p.id:
+                return q
+        key = _profile_key(p)
+        for q in self.profiles:
+            if _profile_key(q) == key:
+                return q
+        return None
+
+    def export_profiles(self, profiles: list[Profile], path: str,
+                        passphrase: str | None = None) -> dict:
+        """Schreibt die Profile als JSON. Mit Passphrase werden gespeicherte Passwörter
+        verschlüsselt mitgegeben, sonst nie. Gibt {'count', 'passwords'} zurück."""
+        crypto, keys = None, None
+        if passphrase:
+            crypto, keys = new_export_key(passphrase)
+        entries, with_pw = [], 0
+        for p in profiles:
+            d = asdict(p)
+            d.pop("save_password", None)
+            if keys:
+                pw = self.get_password(p)
+                if pw:
+                    d["password"] = encrypt_secret(pw, *keys)
+                    with_pw += 1
+            entries.append(d)
+        payload = {
+            "format": EXPORT_FORMAT, "version": 1, "app": "LDAP Admin",
+            "exported": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "encryption": crypto, "connections": entries,
+        }
+        tmp = Path(path).with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), "utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        tmp.replace(path)
+        return {"count": len(entries), "passwords": with_pw}
+
+    def import_profiles(self, data: "ExportFile", indices: list[int], on_exists: str = "skip",
+                        passphrase: str | None = None) -> dict:
+        """on_exists: 'skip' | 'replace' | 'copy'. Gibt eine Statistik zurück."""
+        keys = data.unlock(passphrase) if (passphrase and data.encrypted) else None
+        # Alle Passwörter vorab entschlüsseln – bei einem Fehler bleibt nichts halb importiert
+        passwords = {i: decrypt_secret(data.connections[i][1], *keys)
+                     for i in indices if keys and data.connections[i][1]}
+        stats = {"added": 0, "replaced": 0, "skipped": 0, "passwords": 0,
+                 "passwords_not_stored": 0}
+        for i in indices:
+            p, token = data.connections[i]
+            p = replace(p)
+            existing = self.find_existing(p)
+            if existing is not None and on_exists == "skip":
+                stats["skipped"] += 1
+                continue
+            if existing is not None and on_exists == "replace":
+                had_pw = existing.save_password
+                p.id = existing.id
+                p.save_password = had_pw and token is None   # altes Passwort behalten
+                self.profiles[self.profiles.index(existing)] = p
+                stats["replaced"] += 1
+            else:
+                if existing is not None or any(q.id == p.id for q in self.profiles):
+                    p.id = uuid.uuid4().hex
+                if existing is not None:
+                    p.name = self._free_name(f"{p.name} (importiert)")
+                p.save_password = False
+                self.profiles.append(p)
+                stats["added"] += 1
+            if i in passwords:
+                if self.set_password(p, passwords[i]):
+                    p.save_password = True
+                    stats["passwords"] += 1
+                else:
+                    stats["passwords_not_stored"] += 1
+        self.save()
+        return stats
+
+    def _free_name(self, name: str) -> str:
+        names = {q.name for q in self.profiles}
+        if name not in names:
+            return name
+        n = 2
+        while f"{name} {n}" in names:
+            n += 1
+        return f"{name} {n}"
+
+
+def _profile_key(p: Profile) -> tuple:
+    return (p.host.strip().lower(), int(p.port), norm_dn(p.bind_dn), norm_dn(p.base_dn))
+
+
+# --------------------------------------------------------------------------- #
+# Verschlüsselung für exportierte Passwörter (nur Standardbibliothek)
+#   Schlüssel:  PBKDF2-HMAC-SHA256 (600 000 Runden, zufälliges Salz) → 64 Byte
+#   Verfahren:  HMAC-SHA256 im Zählermodus als Schlüsselstrom, danach
+#               HMAC-SHA256 über Nonce+Chiffrat (Encrypt-then-MAC)
+# --------------------------------------------------------------------------- #
+EXPORT_FORMAT = "ldap-admin-connections"
+KDF_ITERATIONS = 600_000
+_CHECK_TEXT = "ldap-admin"
+
+
+def _derive_keys(passphrase: str, salt: bytes, iterations: int) -> tuple[bytes, bytes]:
+    key = hashlib.pbkdf2_hmac("sha256", passphrase.encode("utf-8"), salt, iterations, dklen=64)
+    return key[:32], key[32:]
+
+
+def _keystream(key: bytes, nonce: bytes, size: int) -> bytes:
+    out = bytearray()
+    counter = 0
+    while len(out) < size:
+        out += hmac.new(key, nonce + counter.to_bytes(8, "big"), hashlib.sha256).digest()
+        counter += 1
+    return bytes(out[:size])
+
+
+def encrypt_secret(text: str, enc_key: bytes, mac_key: bytes) -> str:
+    nonce = secrets.token_bytes(16)
+    data = text.encode("utf-8")
+    cipher = bytes(a ^ b for a, b in zip(data, _keystream(enc_key, nonce, len(data))))
+    tag = hmac.new(mac_key, nonce + cipher, hashlib.sha256).digest()
+    return base64.b64encode(nonce + cipher + tag).decode("ascii")
+
+
+def decrypt_secret(token: str, enc_key: bytes, mac_key: bytes) -> str:
+    try:
+        raw = base64.b64decode(token, validate=True)
+    except (ValueError, TypeError) as exc:
+        raise LdapError("Beschädigter Passwort-Eintrag in der Exportdatei.") from exc
+    if len(raw) < 48:
+        raise LdapError("Beschädigter Passwort-Eintrag in der Exportdatei.")
+    nonce, cipher, tag = raw[:16], raw[16:-32], raw[-32:]
+    expected = hmac.new(mac_key, nonce + cipher, hashlib.sha256).digest()
+    if not hmac.compare_digest(tag, expected):
+        raise LdapError("Falsche Passphrase oder veränderte Datei.")
+    data = bytes(a ^ b for a, b in zip(cipher, _keystream(enc_key, nonce, len(cipher))))
+    return data.decode("utf-8")
+
+
+def new_export_key(passphrase: str) -> tuple[dict, tuple[bytes, bytes]]:
+    salt = secrets.token_bytes(16)
+    keys = _derive_keys(passphrase, salt, KDF_ITERATIONS)
+    info = {"kdf": "pbkdf2-sha256", "iterations": KDF_ITERATIONS,
+            "salt": base64.b64encode(salt).decode("ascii"),
+            "cipher": "hmac-sha256-ctr+hmac-sha256",
+            "check": encrypt_secret(_CHECK_TEXT, *keys)}
+    return info, keys
+
+
+@dataclass
+class ExportFile:
+    connections: list            # [(Profile, verschlüsseltes Passwort oder None)]
+    encryption: dict | None = None
+    exported: str = ""
+
+    @property
+    def encrypted(self) -> bool:
+        return bool(self.encryption) and any(t for _, t in self.connections)
+
+    def unlock(self, passphrase: str) -> tuple[bytes, bytes]:
+        info = self.encryption or {}
+        if info.get("kdf") != "pbkdf2-sha256":
+            raise LdapError("Unbekanntes Verschlüsselungsverfahren in der Exportdatei.")
+        keys = _derive_keys(passphrase, base64.b64decode(info["salt"]), int(info["iterations"]))
+        if decrypt_secret(info["check"], *keys) != _CHECK_TEXT:
+            raise LdapError("Falsche Passphrase.")
+        return keys
+
+
+def read_export(path: str) -> ExportFile:
+    """Liest eine Exportdatei (oder direkt eine connections.json von LDAP Admin)."""
+    try:
+        data = json.loads(Path(path).read_text("utf-8-sig"))
+    except (OSError, UnicodeDecodeError) as exc:
+        raise LdapError(f"Datei kann nicht gelesen werden:\n{exc}") from exc
+    except ValueError as exc:
+        raise LdapError(f"Keine gültige JSON-Datei:\n{exc}") from exc
+    if not isinstance(data, dict) or not isinstance(data.get("connections"), list):
+        raise LdapError("Die Datei enthält keine Verbindungen von LDAP Admin.")
+    if data.get("format") not in (None, EXPORT_FORMAT):
+        raise LdapError(f"Unbekanntes Dateiformat: {data.get('format')}")
+    if int(data.get("version", 1)) > 1:
+        raise LdapError("Die Datei stammt von einer neueren Version von LDAP Admin.")
+    conns = []
+    for d in data["connections"]:
+        if not isinstance(d, dict) or not d.get("host"):
+            continue
+        token = d.get("password") if isinstance(d.get("password"), str) else None
+        p = Profile.from_dict(d)
+        p.save_password = False
+        conns.append((p, token))
+    if not conns:
+        raise LdapError("Die Datei enthält keine Verbindungen.")
+    return ExportFile(conns, data.get("encryption"), str(data.get("exported", "")))
 
 
 # --------------------------------------------------------------------------- #
@@ -386,6 +588,70 @@ def parse_ldif(text: str, base_dir: str | None = None) -> list[LdifRecord]:
             raise LdapError(f"LDIF Zeile {no}: unbekannter changetype „{rec.changetype}“.")
         records.append(rec)
     return records
+
+
+# --------------------------------------------------------------------------- #
+# Suchfilter aus Bedingungen (Attribut – Vergleich – Wert)
+# --------------------------------------------------------------------------- #
+FILTER_OPS = [
+    ("contains", "enthält"),
+    ("equals", "ist gleich"),
+    ("starts", "beginnt mit"),
+    ("ends", "endet mit"),
+    ("present", "ist vorhanden"),
+    ("not_contains", "enthält nicht"),
+    ("not_equals", "ist nicht"),
+    ("absent", "fehlt"),
+    ("ge", "≥ (größer/gleich)"),
+    ("le", "≤ (kleiner/gleich)"),
+]
+OPS_WITHOUT_VALUE = {"present", "absent"}
+FREQUENT_ATTRS = ["cn", "uid", "mail", "sn", "givenName", "displayName", "objectClass", "ou",
+                  "description", "member", "memberUid", "uidNumber", "gidNumber",
+                  "telephoneNumber", "sAMAccountName", "userPrincipalName"]
+_ATTR_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-.;")
+
+
+def _escape_with_wildcards(value: str) -> str:
+    """Maskiert Sonderzeichen; * bleibt als Platzhalter erhalten."""
+    return "*".join(escape_filter_chars(part) for part in value.split("*"))
+
+
+def condition_filter(attr: str, op: str, value: str = "") -> str | None:
+    """Ein Teilfilter, z. B. ('mail', 'ends', '@firma.ch') → (mail=*@firma.ch).
+    Gibt None zurück, wenn die Bedingung (noch) unvollständig ist."""
+    attr = attr.strip()
+    if not attr:
+        return None
+    if not set(attr) <= _ATTR_CHARS:
+        raise LdapError(f"Ungültiger Attributname: „{attr}“")
+    if op == "present":
+        return f"({attr}=*)"
+    if op == "absent":
+        return f"(!({attr}=*))"
+    if value == "":
+        return None
+    v = _escape_with_wildcards(value)
+    patterns = {
+        "contains": f"({attr}=*{v}*)", "equals": f"({attr}={v})",
+        "starts": f"({attr}={v}*)", "ends": f"({attr}=*{v})",
+        "not_contains": f"(!({attr}=*{v}*))", "not_equals": f"(!({attr}={v}))",
+        "ge": f"({attr}>={escape_filter_chars(value)})",
+        "le": f"({attr}<={escape_filter_chars(value)})",
+    }
+    if op not in patterns:
+        raise LdapError(f"Unbekannter Vergleich: {op}")
+    return re.sub(r"\*{2,}", "*", patterns[op])      # ** → * (maskierte Sterne sind \2a)
+
+
+def build_filter(conditions: list[tuple[str, str, str]], combine: str = "and") -> str:
+    """Setzt Bedingungen zu einem LDAP-Filter zusammen. Unvollständige werden ignoriert."""
+    parts = [f for f in (condition_filter(a, o, v) for a, o, v in conditions) if f]
+    if not parts:
+        return "(objectClass=*)"
+    if len(parts) == 1:
+        return parts[0]
+    return ("(&%s)" if combine == "and" else "(|%s)") % "".join(parts)
 
 
 def _replace_suffix(value, old: str, new: str):

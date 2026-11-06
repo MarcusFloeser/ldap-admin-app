@@ -59,7 +59,7 @@ cat > "$APP/Contents/Info.plist" <<'EOF'
   <key>CFBundleExecutable</key><string>LDAP Admin</string>
   <key>CFBundleIdentifier</key><string>local.ldap-admin</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.10</string>
+  <key>CFBundleShortVersionString</key><string>1.12</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>11.0</string>
   <key>NSHighResolutionCapable</key><true/>
